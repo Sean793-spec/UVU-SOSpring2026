@@ -1,0 +1,45 @@
+# --- Unity (must keep Assets/, ProjectSettings/, Packages/) ---
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+MemoryCaptures/
+Recordings/
+CrashReports/
+*.pidb
+*.suo
+*.user
+*.userprefs
+*.csproj
+*.unityproj
+*.sln
+*.tmp
+*.svd
+.vs/
+.idea/
+.DS_Store
+*.ReSharper*/
+*.DotSettings.user
+
+# --- Unity artifacts ---
+*.unitypackage
+
+# --- Maya project inside Assets/_Maya ---
+Assets/_Maya/autosave/
+Assets/_Maya/cache/
+Assets/_Maya/data/
+Assets/_Maya/sound/
+Assets/_Maya/timeEditor/
+Assets/_Maya/workspace.mel         # (optional—only if you use a custom workspace elsewhere)
+Assets/_Maya/images/               # rendered frames—keep out of Git
+Assets/_Maya/renders/              # rendered frames—keep out of Git
+
+# --- Generated/Temp images/renders generally ---
+*.iff
+*.tga
+*.png.tmp
+*.psb
+Thumbs.db
