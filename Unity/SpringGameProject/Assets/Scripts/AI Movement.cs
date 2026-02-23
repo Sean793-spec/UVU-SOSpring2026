@@ -32,6 +32,13 @@ public class AIMovement : MonoBehaviour
     [Tooltip("How many times to attempt sampling a NavMesh position for a randomly chosen point.")]
     public int navMeshSampleAttempts = 3;
 
+    // New: rotation behavior on collision
+    [Header("Collision Rotation")]
+    [Tooltip("If true, the AI will rotate to face the new target when a collision occurs.")]
+    public bool rotateOnCollision = true;
+    [Tooltip("Duration (seconds) of the facing rotation on collision. Set to 0 for an instant snap.")]
+    public float collisionRotateDuration = 0.4f;
+
     // Internal state
     private Vector3 _startPosition;
     private Vector3 _targetPosition;
@@ -42,6 +49,10 @@ public class AIMovement : MonoBehaviour
     // NavMeshAgent reference
     private NavMeshAgent _agent;
     private Coroutine _tempMoveCoroutine;
+    // Rotation coroutine handle used for collision rotation
+    private Coroutine _rotationCoroutine;
+    // Move-and-lock coroutine handle used by external callers (e.g., Chair)
+    private Coroutine _moveAndLockCoroutine;
 
     void Start()
     {
@@ -213,6 +224,35 @@ public class AIMovement : MonoBehaviour
         Vector3 center = (roamCenterTransform != null) ? roamCenterTransform.position : _startPosition;
         Vector3 newTarget = GetRandomTarget(center);
 
+        // compute horizontal direction to the new target
+        Vector3 dir = newTarget - transform.position;
+        dir.y = 0f;
+
+        // If rotation on collision is enabled, rotate first (smooth or snap depending on duration)
+        if (rotateOnCollision && dir.sqrMagnitude > 0.0001f)
+        {
+            // If a rotation coroutine is already running, stop it so we start fresh
+            if (_rotationCoroutine != null)
+            {
+                StopCoroutine(_rotationCoroutine);
+                _rotationCoroutine = null;
+            }
+
+            // If we have a NavMeshAgent on the NavMesh, rotate and then set destination. Otherwise rotate and do fallback move.
+            if (_agent != null && _agent.isOnNavMesh)
+            {
+                _rotationCoroutine = StartCoroutine(RotateThenSetAgentDestination(newTarget, collisionRotateDuration));
+                return; // rotation coroutine will set destination/move after rotating
+            }
+            else
+            {
+                // Fallback: rotate, then interrupt roaming and move directly
+                _rotationCoroutine = StartCoroutine(RotateThenTemporaryMove(newTarget, collisionRotateDuration));
+                return;
+            }
+        }
+
+        // If we reach here, either rotation is disabled or direction is degenerate.
         // If agent is available and on NavMesh, set destination immediately
         if (_agent != null && _agent.isOnNavMesh)
         {
@@ -238,13 +278,90 @@ public class AIMovement : MonoBehaviour
         }
     }
 
-    private IEnumerator TemporaryTransformMoveThenResume(Vector3 target)
+    // Smoothly rotate the transform to face the target over "duration" seconds.
+    // If duration is zero or negative, snap immediately.
+    private IEnumerator RotateTowards(Vector3 targetWorldPos, float duration)
     {
-        // Move to the given target (fallback), then wait a bit and resume roaming
-        yield return StartCoroutine(TransformMoveToTarget(target));
-        float pause = Random.Range(minPause, maxPause);
-        yield return new WaitForSeconds(pause);
-        StartRoaming();
+        Vector3 toTarget = targetWorldPos - transform.position;
+        toTarget.y = 0f;
+        if (toTarget.sqrMagnitude <= 0.0001f)
+            yield break;
+
+        Quaternion startRot = transform.rotation;
+        Quaternion endRot = Quaternion.LookRotation(toTarget);
+
+        if (duration <= 0f)
+        {
+            transform.rotation = endRot;
+            yield break;
+        }
+
+        float t = 0f;
+        while (t < duration)
+        {
+            t += Time.deltaTime;
+            float frac = Mathf.Clamp01(t / duration);
+            transform.rotation = Quaternion.Slerp(startRot, endRot, frac);
+            yield return null;
+        }
+
+        transform.rotation = endRot;
+    }
+
+    // Helper coroutine: disable agent rotation, rotate, then set destination and re-enable rotation.
+    private IEnumerator RotateThenSetAgentDestination(Vector3 dest, float duration)
+    {
+        if (_agent != null)
+        {
+            bool prevUpdateRot = _agent.updateRotation;
+            _agent.updateRotation = false;
+
+            yield return StartCoroutine(RotateTowards(dest, duration));
+
+            // restore agent rotation control and set destination
+            _agent.updateRotation = prevUpdateRot;
+            _agent.ResetPath();
+            _agent.SetDestination(dest);
+        }
+        else
+        {
+            // fallback just rotate then set destination using transform movement
+            yield return StartCoroutine(RotateTowards(dest, duration));
+            if (_roamCoroutine != null)
+            {
+                StopCoroutine(_roamCoroutine);
+                _roamCoroutine = null;
+            }
+            if (_tempMoveCoroutine != null)
+            {
+                StopCoroutine(_tempMoveCoroutine);
+                _tempMoveCoroutine = null;
+            }
+            _tempMoveCoroutine = StartCoroutine(TemporaryTransformMoveThenResume(dest));
+        }
+
+        _rotationCoroutine = null;
+    }
+
+    // Helper coroutine for fallback: rotate then start a temporary transform move
+    private IEnumerator RotateThenTemporaryMove(Vector3 dest, float duration)
+    {
+        yield return StartCoroutine(RotateTowards(dest, duration));
+
+        if (_roamCoroutine != null)
+        {
+            StopCoroutine(_roamCoroutine);
+            _roamCoroutine = null;
+        }
+
+        if (_tempMoveCoroutine != null)
+        {
+            StopCoroutine(_tempMoveCoroutine);
+            _tempMoveCoroutine = null;
+        }
+
+        _tempMoveCoroutine = StartCoroutine(TemporaryTransformMoveThenResume(dest));
+        _rotationCoroutine = null;
     }
 
     // Fallback movement when no NavMeshAgent or invalid path
@@ -256,92 +373,111 @@ public class AIMovement : MonoBehaviour
             Vector3 direction = target - transform.position;
             direction.y = 0f;
 
-            if (direction.sqrMagnitude > 0.001f)
-            {
-                // rotate smoothly towards movement direction
-                Quaternion toRotation = Quaternion.LookRotation(direction);
-                transform.rotation = Quaternion.Slerp(transform.rotation, toRotation, rotationSpeed * Time.deltaTime);
-
-                // move forward
-                transform.position += transform.forward * (moveSpeed * Time.deltaTime);
-            }
-            else
-            {
+            if (direction.sqrMagnitude <= 0.0001f)
                 break;
-            }
+
+            // rotate smoothly toward move direction
+            Quaternion desired = Quaternion.LookRotation(direction);
+            transform.rotation = Quaternion.Slerp(transform.rotation, desired, rotationSpeed * Time.deltaTime);
+
+            // move forward along horizontal direction
+            transform.position += direction.normalized * moveSpeed * Time.deltaTime;
 
             yield return null;
         }
+
+        yield break;
     }
 
-    // Optional: change roam center at runtime
-    public void SetRoamCenter(Vector3 worldPosition)
+    // Temporary move used when we interrupt roaming (transform fallback).
+    // After reaching the destination, resume the roaming coroutine.
+    private IEnumerator TemporaryTransformMoveThenResume(Vector3 dest)
     {
-        _startPosition = worldPosition;
+        // perform the transform-based move
+        yield return StartCoroutine(TransformMoveToTarget(dest));
+
+        // clear temp handle
+        _tempMoveCoroutine = null;
+
+        // small pause before resuming roaming (helps avoid immediate re-collisions)
+        yield return new WaitForSeconds(Random.Range(minPause, maxPause));
+
+        // resume roaming
+        if (_roamCoroutine != null)
+            StopCoroutine(_roamCoroutine);
+        _roamCoroutine = StartCoroutine(RoamRoutine());
     }
 
-    // Helper API: allow runtime changes to roaming parameters
-    public void SetRoamRadius(float radius)
+    // Public API: move the AI to a world position or transform and lock it there for lockSeconds
+    // After the lock time elapses, the AI will resume roaming.
+    public void MoveToAndLock(Transform targetTransform, float lockSeconds)
     {
-        roamRadius = Mathf.Max(0f, radius);
+        if (targetTransform == null) return;
+        MoveToAndLock(targetTransform.position, lockSeconds);
     }
 
-    public void SetUseBoxArea(bool use)
+    public void MoveToAndLock(Vector3 worldPosition, float lockSeconds)
     {
-        useBoxArea = use;
+        // Cancel any existing move-and-lock action so the latest call wins
+        if (_moveAndLockCoroutine != null)
+            StopCoroutine(_moveAndLockCoroutine);
+        _moveAndLockCoroutine = StartCoroutine(MoveToAndLockCoroutine(worldPosition, lockSeconds));
     }
 
-    public void SetBoxSize(Vector3 size)
+    private IEnumerator MoveToAndLockCoroutine(Vector3 position, float lockSeconds)
     {
-        boxSize = new Vector3(Mathf.Max(0.01f, size.x), 0f, Mathf.Max(0.01f, size.z));
-    }
+        // Stop roaming and any temporary movement
+        if (_roamCoroutine != null)
+        {
+            StopCoroutine(_roamCoroutine);
+            _roamCoroutine = null;
+        }
 
-    public void SetRoamCenterTransform(Transform t)
-    {
-        roamCenterTransform = t;
-    }
+        if (_tempMoveCoroutine != null)
+        {
+            StopCoroutine(_tempMoveCoroutine);
+            _tempMoveCoroutine = null;
+        }
 
-    // Editor-time validation (keeps inspector values sensible)
-    private void OnValidate()
-    {
-        roamRadius = Mathf.Max(0f, roamRadius);
-        stoppingDistance = Mathf.Max(0f, stoppingDistance);
-        moveSpeed = Mathf.Max(0f, moveSpeed);
-        rotationSpeed = Mathf.Max(0f, rotationSpeed);
-        minPause = Mathf.Max(0f, minPause);
-        maxPause = Mathf.Max(minPause, maxPause);
-        boxSize.x = Mathf.Max(0.01f, boxSize.x);
-        boxSize.z = Mathf.Max(0.01f, boxSize.z);
-
-        // If agent exists in editor, keep some values in sync
-        if (_agent != null)
+        // If we have a NavMeshAgent and it's on the NavMesh, use it to move to the chair
+        if (_agent != null && _agent.isOnNavMesh)
+        {
+            // Ensure agent uses inspector configured speed
             ApplyAgentSettings();
+            _agent.isStopped = false;
+            _agent.ResetPath();
+            _agent.SetDestination(position);
+
+            // Wait for path calculation / travel with timeout
+            float travelTimeout = Mathf.Max(5f, lockSeconds + 5f);
+            float start = Time.time;
+            while ((_agent.pathPending || _agent.hasPath) && _agent.remainingDistance > Mathf.Max(0.01f, stoppingDistance))
+            {
+                if (Time.time - start > travelTimeout)
+                    break; // prevent getting stuck
+                yield return null;
+            }
+
+            // Arrived or timed out: stop the agent and hold position for lockSeconds
+            _agent.isStopped = true;
+            // Wait while locked
+            yield return new WaitForSeconds(lockSeconds);
+
+            // Resume agent movement and roaming
+            _agent.isStopped = false;
+            _moveAndLockCoroutine = null;
+            StartRoaming();
+            yield break;
+        }
+
+        // Fallback: no agent or not on NavMesh — use transform movement then wait
+        yield return StartCoroutine(TransformMoveToTarget(position));
+
+        // When arrived, stay for lockSeconds
+        yield return new WaitForSeconds(lockSeconds);
+
+        _moveAndLockCoroutine = null;
+        StartRoaming();
     }
 
-    // Debug drawing in editor
-    private void OnDrawGizmosSelected()
-    {
-        Gizmos.color = Color.green;
-        Vector3 center = Application.isPlaying ? _startPosition : transform.position;
-
-        // If a roamCenterTransform is assigned, show it as the center in editor
-        if (roamCenterTransform != null)
-            center = roamCenterTransform.position;
-
-        if (useBoxArea)
-        {
-            Gizmos.DrawWireCube(center, new Vector3(boxSize.x, 0.1f, boxSize.z));
-        }
-        else
-        {
-            Gizmos.DrawWireSphere(center, roamRadius);
-        }
-
-        if (_hasTarget)
-        {
-            Gizmos.color = Color.red;
-            Gizmos.DrawSphere(_targetPosition, 0.2f);
-            Gizmos.DrawLine(center, _targetPosition);
-        }
-    }
 }
